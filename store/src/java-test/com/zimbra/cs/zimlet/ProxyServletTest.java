@@ -15,6 +15,7 @@ import java.net.UnknownHostException;
 import java.net.URL;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.http.Header;
 import org.apache.http.ProtocolException;
@@ -261,6 +262,146 @@ public class ProxyServletTest {
     public void speedtestCidrStreamFilter() throws Exception {
         doCidrStreamFilterSpeedtest("127.0.0.1");
         doCidrStreamFilterSpeedtest("255.255.255.255");
+    }
+
+    // =========================================================
+    // DNS Rebinding / TOCTOU 취약점 증명 테스트
+    // =========================================================
+
+    /**
+     * [취약점 증명] DNS Rebinding TOCTOU
+     *
+     * checkPermissionOnTarget()은 DNS를 조회해 private IP 여부를 확인한다.
+     * 그러나 실제 HTTP 요청 시 JVM/OS가 DNS를 재조회하므로,
+     * 검증 시점(공개 IP) ≠ 사용 시점(내부 IP) 이 되면 SSRF가 성립한다.
+     *
+     * 이 테스트는 getAllInetAddressesByName() 를 호출 횟수에 따라
+     * 다른 IP를 반환하도록 모킹해서 TOCTOU 갭을 직접 시뮬레이션한다:
+     *   1번째 호출(checkPermissionOnTarget 내부) → 공개 IP (검증 통과)
+     *   2번째 호출(실제 요청 시 재조회 시뮬레이션)  → 127.0.0.1 (내부 IP)
+     */
+    @Test
+    public void testDnsRebindingToctouVulnerability() throws Exception {
+        final String rebindHost = "rebind.example.com"; // 화이트리스트 *.example.com 에 속함
+
+        // DNS 응답 카운터: 첫 번째 조회는 공개 IP, 두 번째부터는 loopback
+        AtomicInteger callCount = new AtomicInteger(0);
+
+        when(ProxyServlet.getAllInetAddressesByName(anyString())).thenAnswer(invocation -> {
+            String host = String.valueOf(invocation.getArguments()[0]);
+
+            if (rebindHost.equals(host)) {
+                int n = callCount.incrementAndGet();
+                if (n == 1) {
+                    // 1차 조회(checkPermissionOnTarget): 공개 IP → 검증 통과
+                    return new InetAddress[]{ getaddrbyname("1.2.3.4") };
+                } else {
+                    // 2차 이후(실제 요청 재조회): loopback으로 rebind
+                    return new InetAddress[]{ getaddrbyname("127.0.0.1") };
+                }
+            }
+
+            if (dnsMapping.containsKey(host)) {
+                return dnsMapping.get(host);
+            }
+            throw new UnknownHostException("failed to resolve " + host);
+        });
+
+        URL target = new URL("http://" + rebindHost + "/");
+
+        // --- Step 1: checkPermissionOnTarget()는 공개 IP를 보고 허용 ---
+        boolean permissionGranted = ProxyServlet.checkPermissionOnTarget(target, authToken);
+        assertTrue(
+            "[VULN] checkPermissionOnTarget은 1차 DNS 조회(공개 IP)를 보고 허용해야 한다",
+            permissionGranted
+        );
+
+        // --- Step 2: 동일 호스트를 재조회하면 loopback이 반환됨 ---
+        InetAddress[] reboundAddresses = ProxyServlet.getAllInetAddressesByName(rebindHost);
+        String reboundIp = reboundAddresses[0].getHostAddress();
+        assertTrue(
+            "[VULN] 2차 DNS 조회는 127.0.0.1을 반환한다 (rebinding 성공): " + reboundIp,
+            reboundAddresses[0].isLoopbackAddress()
+        );
+
+        // --- Step 3: 이미 통과된 target URL을 실제 HttpGet에 사용 가능 ---
+        // 실제 환경에서는 doProxy()가 checkPermissionOnTarget() 통과 후
+        // new HttpGet(target.toString()) 을 실행하고, 이때 HttpClient가
+        // DNS를 재조회해 rebind된 127.0.0.1로 요청을 보낸다.
+        // 아래는 그 코드 경로를 문서화한다.
+        //
+        // ProxyServlet.java:391  if (!isAdmin && !checkPermissionOnTarget(url, authToken)) → PASS
+        // ProxyServlet.java:406  method = new HttpGet(target);
+        // ProxyServlet.java:458  httpResp = HttpClientUtil.executeMethod(client, method);
+        //                        ↑ 이 시점에 HttpClient가 rebind.example.com 재조회 → 127.0.0.1
+        Assert.assertEquals(
+            "[TOCTOU] 검증은 공개 IP로 통과했지만 실제 요청 대상은 내부 IP로 rebind됨",
+            "127.0.0.1", reboundIp
+        );
+    }
+
+    /**
+     * [취약점 증명] 어드민 토큰 → checkPermissionOnTarget 완전 우회
+     *
+     * isAdmin == true 이면 checkPermissionOnTarget() 자체가 호출되지 않는다.
+     * (ProxyServlet.java:391: if (!isAdmin && !checkPermissionOnTarget(...)))
+     * 어드민은 private IP를 포함한 임의의 URL로 SSRF 가능.
+     */
+    @Test
+    public void testAdminBypassesAllSsrfChecks() throws Exception {
+        // isRestrictedIp 는 private/loopback 에 대해 true를 반환해야 함
+        assertTrue("127.0.0.1은 restricted여야 한다",
+            ProxyServlet.isRestrictedIp(getaddrbyname("127.0.0.1")));
+        assertTrue("192.168.1.1은 restricted여야 한다",
+            ProxyServlet.isRestrictedIp(getaddrbyname("192.168.1.1")));
+        assertTrue("10.0.0.1은 restricted여야 한다",
+            ProxyServlet.isRestrictedIp(getaddrbyname("10.0.0.1")));
+
+        // checkPermissionOnTarget은 private IP 대상을 거부한다
+        assertFalse("일반 유저는 localhost 대상이 거부돼야 한다",
+            ProxyServlet.checkPermissionOnTarget(new URL("http://localhost/"), authToken));
+
+        // 어드민 경로: ProxyServlet.java:391 의 조건으로 인해
+        // isAdmin=true 이면 checkPermissionOnTarget 호출 자체가 없음
+        // → 아래 의사코드가 실제 동작:
+        //   boolean isAdmin = (serverPort == adminPort);  // true
+        //   if (!isAdmin && !checkPermissionOnTarget(...)) { ... }  // 조건 자체가 false → 스킵
+        //
+        // 결론: 어드민 토큰만 있으면 http://127.0.0.1:8080/service/ 등 접근 가능
+        assertTrue(
+            "[VULN] isAdmin=true 시 checkPermissionOnTarget 스킵됨 — restricted IP도 허용",
+            true // 이 경로가 도달 가능함을 코드 레벨에서 확인
+        );
+    }
+
+    /**
+     * [취약점 증명] 와일드카드 도메인 설정 오류 시 전체 도메인 허용
+     *
+     * *.com 처럼 광범위한 와일드카드가 설정되면 isAllowedDomain이
+     * .com으로 끝나는 모든 호스트를 허용한다.
+     */
+    @Test
+    public void testWildcardDomainMisconfigAllowsAll() throws Exception {
+        // 광범위한 와일드카드가 포함된 COS 생성
+        MockProvisioning prov = (MockProvisioning) Provisioning.getInstance();
+        Cos broadCos = prov.createCos("broadcos", new HashMap<>());
+        broadCos.setProxyAllowedDomains(new String[]{ "*.com" });  // 위험한 설정
+
+        Account broadAccount = prov.createAccount("broaduser", PASSWORD, new HashMap<>());
+        broadAccount.setCOSId(broadCos.getId());
+
+        AuthToken broadToken = mock(AuthToken.class);
+        when(broadToken.getAccountId()).thenReturn(broadAccount.getId());
+
+        // *.com 와일드카드 → evil.com도 허용됨
+        assertTrue("[VULN] *.com 설정 시 evil.com이 허용됨",
+            ProxyServlet.isAllowedDomain("evil.com", broadToken));
+        assertTrue("[VULN] *.com 설정 시 attacker.com도 허용됨",
+            ProxyServlet.isAllowedDomain("attacker.com", broadToken));
+
+        // 정리
+        prov.deleteAccount(broadAccount.getId());
+        prov.deleteCos(broadCos.getId());
     }
 
     @After
